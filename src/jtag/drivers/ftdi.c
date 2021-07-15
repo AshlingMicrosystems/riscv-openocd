@@ -85,15 +85,11 @@
 /* FTDI access library includes */
 #include "mpsse.h"
 
-#if BUILD_FTDI_OSCAN1 == 1
-#define DO_CLOCK_DATA clock_data
-#define DO_CLOCK_TMS_CS clock_tms_cs
-#define DO_CLOCK_TMS_CS_OUT clock_tms_cs_out
-#else
+
 #define DO_CLOCK_DATA mpsse_clock_data
 #define DO_CLOCK_TMS_CS mpsse_clock_tms_cs
 #define DO_CLOCK_TMS_CS_OUT mpsse_clock_tms_cs_out
-#endif
+static bool cjtag_mode;
 
 #define JTAG_MODE (LSB_FIRST | POS_EDGE_IN | NEG_EDGE_OUT)
 #define JTAG_MODE_ALT (LSB_FIRST | NEG_EDGE_IN | NEG_EDGE_OUT)
@@ -105,31 +101,67 @@ static uint8_t ftdi_channel;
 static uint8_t ftdi_jtag_mode = JTAG_MODE;
 
 static bool swd_mode;
+#define TDI_0 0 
+#define TDI_1 1
+#define TMS_0 0 
+#define TMS_1 2 
 
-#if BUILD_FTDI_OSCAN1 == 1
-/*
-  The cJTAG 2-wire OSCAN1 protocol, in lieu of 4-wire JTAG, is a configuration option
-  for some SoCs. An FTDI-based adapter that can be configured to appropriately drive
-  the bidirectional pin TMSC is able to drive OSCAN1 protocol.  For example, an Olimex
-  ARM-USB-TINY-H with the ARM-JTAG-SWD adapter, connected to a cJTAG-enabled
-  target board is such a topology.  A TCK cycle with TMS=1/TDI=N translates to a TMSC
-  output of N, and a TCK cycle with TMS=0 translates to a TMSC input from the target back
-  to the adapter/probe.  The OSCAN1 protocol uses 3 TCK cycles to generate the data flow
-  that is equivalent to that of a single TCK cycle in 4-wire JTAG. The OSCAN1-related
-  code in this module translates IR/DR scan commanads and JTAG state traversal commands
-  to the two-wire clocking and signaling of OSCAN1 protocol, if placed into oscan1 mode
-  during initialization.
-*/
-static void oscan1_reset_online_activate(void);
-static void oscan1_mpsse_clock_data(struct mpsse_ctx *ctx, const uint8_t *out, unsigned out_offset, uint8_t *in,
-				    unsigned in_offset, unsigned length, uint8_t mode);
-static void oscan1_mpsse_clock_tms_cs(struct mpsse_ctx *ctx, const uint8_t *out, unsigned out_offset, uint8_t *in,
-				      unsigned in_offset, unsigned length, bool tdi, uint8_t mode);
-static void oscan1_mpsse_clock_tms_cs_out(struct mpsse_ctx *ctx, const uint8_t *out, unsigned out_offset,
-					  unsigned length, bool tdi, uint8_t mode);
+#define STFMT 3 /*  jtag7 store format command. */
+#define SCNS 9  /* jtag7 scan string */
+#define STMC 0  /* jtag7 Store Miscellaneous Control */
+#define MSC 7   /* jtag7 make scan group candidate */
 
-static bool oscan1_mode;
-#endif
+static const unsigned OSCAN1 = 9;   /* jtag7 format=oscan1 parameter. */
+static const unsigned EXIT_CMD_LVL = 1;
+
+typedef enum
+{
+   normal,
+   oscan1
+} TycJtagScanFormat;
+
+#define MAX_SUPPORTED_SCAN_LENGTH 1000
+static uint8_t pucRxBuffer[MAX_SUPPORTED_SCAN_LENGTH];
+#define MAX_PREAMBLE  6
+#define MAX_POSTAMBLE 2
+
+static TycJtagScanFormat tycJtagScanFormat = normal;
+static int iWantResult = 1;
+static unsigned long ulTxCount = 0;
+static void enter_2wire_mode(void);
+static int want_result(int wr);
+static void set_format(TycJtagScanFormat sf);
+static bool in_normal_scan_mode(void);
+//static int enter_2wire_mode_and_test(void);
+static void enter_oscan1(void);
+static void check_packet(void);
+static void send_check_packet(void);
+static void dummy_scan_packet(void);
+static void send_JTAG(unsigned tms_and_tdi);
+static void send_2part_command(unsigned opcode, unsigned operand);
+static void enter_control_mode(int level);
+static void non_zero_bit_scan_sequence(unsigned amount);
+static void zero_bit_scan_sequence(int repeat);
+static void transitions(const char* tms_values, int tdi_value);
+static void set_JTAG_to_idle(void);
+static void cjtag_move_to_state(tap_state_t goal_state);
+void cjtag_initialize(struct mpsse_ctx* ctx);
+void cjtag_execute_scan(struct jtag_command* cmd);
+static void cjtag_execute_idle_cycles(int32_t count);
+
+
+static struct mpsse_ctx* local_ctx;
+
+static const uint8_t puOPLDcInitializeSequence[] = {
+        0x80, /* Set output pins            */
+        0x68, /*        Value               */
+        0xFB, /*        Direction           */
+        0x82, /* Set output pins (high byte)*/
+        0x0B, /*        Value               */
+        0xFF, /*        Direction           */
+        0x81, /* Read input pins            */
+        0x87  /* Send immediate             */
+};
 
 #define MAX_USB_IDS 8
 /* vid = pid = 0 marks the end of the list */
@@ -232,8 +264,19 @@ static int ftdi_set_signal(const struct signal *s, char value)
 		return ERROR_FAIL;
 	}
 
+   uint8_t val = 0;
+   uint16_t read_value =0;
+   mpsse_read_data_bits_high_byte(mpsse_ctx, &val);
+   mpsse_flush(mpsse_ctx);
+   read_value = val;
+   mpsse_read_data_bits_low_byte(mpsse_ctx, &val);
+   mpsse_flush(mpsse_ctx);
+   read_value <<= 8;
+   read_value |= val; 
+   output = read_value;
 	uint16_t old_output = output;
 	uint16_t old_direction = direction;
+   
 
 	output = data ? output | s->data_mask : output & ~s->data_mask;
 	if (s->oe_mask == s->data_mask)
@@ -276,34 +319,6 @@ static int ftdi_get_signal(const struct signal *s, uint16_t *value_out)
 	return ERROR_OK;
 }
 
-#if BUILD_FTDI_OSCAN1 == 1
-static void clock_data(struct mpsse_ctx *ctx, const uint8_t *out, unsigned out_offset, uint8_t *in,
-		     unsigned in_offset, unsigned length, uint8_t mode)
-{
-	if (oscan1_mode)
-		oscan1_mpsse_clock_data(ctx, out, out_offset, in, in_offset, length, mode);
-	else
-		mpsse_clock_data(ctx, out, out_offset, in, in_offset, length, mode);
-}
-
-static void clock_tms_cs(struct mpsse_ctx *ctx, const uint8_t *out, unsigned out_offset, uint8_t *in,
-		       unsigned in_offset, unsigned length, bool tdi, uint8_t mode)
-{
-	if (oscan1_mode)
-		oscan1_mpsse_clock_tms_cs(ctx, out, out_offset, in, in_offset, length, tdi, mode);
-	else
-		mpsse_clock_tms_cs(ctx, out, out_offset, in, in_offset, length, tdi, mode);
-}
-
-static void clock_tms_cs_out(struct mpsse_ctx *ctx, const uint8_t *out, unsigned out_offset,
-			   unsigned length, bool tdi, uint8_t mode)
-{
-	if (oscan1_mode)
-		oscan1_mpsse_clock_tms_cs_out(ctx, out, out_offset, length, tdi, mode);
-	else
-		mpsse_clock_tms_cs_out(ctx, out, out_offset, length, tdi, mode);
-}
-#endif
 
 /**
  * Function move_to_state
@@ -670,24 +685,45 @@ static void ftdi_execute_command(struct jtag_command *cmd)
 {
 	switch (cmd->type) {
 		case JTAG_RESET:
-#if BUILD_FTDI_OSCAN1 == 1
-			oscan1_reset_online_activate(); /* put the target back into OSCAN1 mode */
-#endif
+         /* Initialize cJTAG */
+         cjtag_initialize(mpsse_ctx);
+         /* The initialise function above ends in the IDLE state */
+         transitions("111110", TDI_0);
+         tap_set_state(TAP_RESET);
 			break;
 		case JTAG_RUNTEST:
-			ftdi_execute_runtest(cmd);
+
+			
+         if (cjtag_mode) {
+            cjtag_execute_idle_cycles(cmd->cmd.runtest->num_cycles);
+         }
+         else
+         {
+            ftdi_execute_runtest(cmd);
+         }
 			break;
 		case JTAG_TLR_RESET:
-			ftdi_execute_statemove(cmd);
-#if BUILD_FTDI_OSCAN1 == 1
-			oscan1_reset_online_activate(); /* put the target back into OSCAN1 mode */
-#endif
+         if (cjtag_mode) {
+            
+            /* Initialize cJTAG */
+            cjtag_initialize(mpsse_ctx);
+            /* The initialise function above ends in the IDLE state */
+            //tap_set_state(TAP_IDLE);
+         }
+         else {
+            ftdi_execute_statemove(cmd);
+         }
 			break;
 		case JTAG_PATHMOVE:
 			ftdi_execute_pathmove(cmd);
 			break;
 		case JTAG_SCAN:
-			ftdi_execute_scan(cmd);
+         if (cjtag_mode) {
+            cjtag_execute_scan(cmd);
+         }
+         else {
+            ftdi_execute_scan(cmd);
+         }
 			break;
 		case JTAG_SLEEP:
 			ftdi_execute_sleep(cmd);
@@ -751,6 +787,14 @@ static int ftdi_initialize(void)
 	output = jtag_output_init;
 	direction = jtag_direction_init;
 
+   struct transport* transport;
+   transport = get_current_transport();
+
+   cjtag_mode = false;
+   if ((transport) && (strcmp(transport->name, "cjtag") == 0)) {
+      cjtag_mode = true;
+   }
+
 	if (swd_mode) {
 		struct signal *sig = find_signal_by_name("SWD_EN");
 		if (!sig) {
@@ -760,17 +804,6 @@ static int ftdi_initialize(void)
 		/* A dummy SWD_EN would have zero mask */
 		if (sig->data_mask)
 			ftdi_set_signal(sig, '1');
-#if BUILD_FTDI_OSCAN1 == 1
-	} else if (oscan1_mode) {
-		struct signal *sig = find_signal_by_name("JTAG_SEL");
-		if (!sig) {
-			LOG_ERROR("OSCAN1 mode is active but JTAG_SEL signal is not defined");
-			return ERROR_JTAG_INIT_FAILED;
-		}
-		/* A dummy JTAG_SEL would have zero mask */
-		if (sig->data_mask)
-			ftdi_set_signal(sig, '0');
-#endif
 	}
 
 	mpsse_set_data_bits_low_byte(mpsse_ctx, output & 0xff, direction & 0xff);
@@ -803,253 +836,8 @@ static int ftdi_quit(void)
 	return ERROR_OK;
 }
 
-#if BUILD_FTDI_OSCAN1 == 1
-static void oscan1_mpsse_clock_data(struct mpsse_ctx *ctx, const uint8_t *out, unsigned out_offset, uint8_t *in,
-		     unsigned in_offset, unsigned length, uint8_t mode)
-{
-	static const uint8_t zero;
-	static const uint8_t one = 1;
-
-	LOG_DEBUG_IO("oscan1_mpsse_clock_data: %sout %d bits", in ? "in" : "", length);
-
-	for (unsigned i = 0; i < length; i++) {
-		int bitnum;
-		uint8_t bit;
-
-		/* OSCAN1 uses 3 separate clocks */
-
-		/* drive TMSC to the *negation* of the desired TDI value */
-		bitnum = out_offset + i;
-		bit = out ? ((out[bitnum/8] >> (bitnum%8)) & 0x1) : 0;
-
-		/* Try optimized case first: if desired TDI bit is 1, then we
-		   can fuse what would otherwise be the first two MPSSE commands */
-		if (bit) {
-			const uint8_t tmsbits = 0x3;  /* 1, 1 */
-			mpsse_clock_tms_cs_out(mpsse_ctx, &tmsbits, 0, 2, false, mode);
-		} else {
-			/* Can't fuse because TDI varies; less efficient */
-			mpsse_clock_tms_cs_out(mpsse_ctx, &one, 0, 1, bit ? 0 : 1, mode);
-
-			/* drive TMSC to desired TMS value (always zero in this context) */
-			mpsse_clock_tms_cs_out(mpsse_ctx, &one, 0, 1, false, mode);
-		}
-
-		/* drive another TCK without driving TMSC (TDO cycle) */
-		mpsse_clock_tms_cs(mpsse_ctx, &zero, 0, in, in_offset+i, 1, false, mode);
-	}
-}
 
 
-static void oscan1_mpsse_clock_tms_cs(struct mpsse_ctx *ctx, const uint8_t *out, unsigned out_offset, uint8_t *in,
-		       unsigned in_offset, unsigned length, bool tdi, uint8_t mode)
-{
-	static const uint8_t zero;
-	static const uint8_t one = 1;
-
-	LOG_DEBUG_IO("oscan1_mpsse_clock_tms_cs: %sout %d bits, tdi=%d", in ? "in" : "", length, tdi);
-
-	for (unsigned i = 0; i < length; i++) {
-		int bitnum;
-		uint8_t tmsbit;
-		uint8_t tdibit;
-
-		/* OSCAN1 uses 3 separate clocks */
-
-		/* drive TMSC to the *negation* of the desired TDI value */
-		tdibit = tdi ? 0 : 1;
-
-		/* drive TMSC to desired TMS value */
-		bitnum = out_offset + i;
-		tmsbit = ((out[bitnum/8] >> (bitnum%8)) & 0x1);
-
-		if (tdibit == tmsbit) {
-			/* Can squash into a single MPSSE command */
-			const uint8_t tmsbits = 0x3;
-			mpsse_clock_tms_cs_out(mpsse_ctx, &tmsbits, 0, 2, tdibit, mode);
-		} else {
-			/* Unoptimized case, can't formulate with a single command */
-			mpsse_clock_tms_cs_out(mpsse_ctx, &one, 0, 1, tdibit, mode);
-			mpsse_clock_tms_cs_out(mpsse_ctx, &one, 0, 1, (tmsbit != 0), mode);
-		}
-
-		/* drive another TCK without driving TMSC (TDO cycle) */
-		mpsse_clock_tms_cs(mpsse_ctx, &zero, 0, in, in_offset+i, 1, false, mode);
-	}
-}
-
-
-static void oscan1_mpsse_clock_tms_cs_out(struct mpsse_ctx *ctx, const uint8_t *out, unsigned out_offset,
-			   unsigned length, bool tdi, uint8_t mode)
-{
-	oscan1_mpsse_clock_tms_cs(ctx, out, out_offset, 0, 0, length, tdi, mode);
-}
-
-
-static void oscan1_set_tck_tms_tdi(struct signal *tck, char tckvalue, struct signal *tms,
-				   char tmsvalue, struct signal *tdi, char tdivalue)
-{
-	ftdi_set_signal(tms, tmsvalue);
-	ftdi_set_signal(tdi, tdivalue);
-	ftdi_set_signal(tck, tckvalue);
-}
-
-static void oscan1_reset_online_activate(void)
-{
-	/* After TAP reset, the OSCAN1-to-JTAG adapter is in offline and
-	non-activated state.  Escape sequences are needed to bring
-	the TAP online and activated into OSCAN1 mode. */
-
-	struct signal *tck = find_signal_by_name("TCK");
-	struct signal *tdi = find_signal_by_name("TDI");
-	struct signal *tms = find_signal_by_name("TMS");
-	struct signal *tdo = find_signal_by_name("TDO");
-	uint16_t tdovalue;
-
-	static const struct {
-	  int8_t tck;
-	  int8_t tms;
-	  int8_t tdi;
-	} sequence[] = {
-	  /* TCK=0, TMS=1, TDI=0 (drive TMSC to 0 baseline) */
-	  {'0', '1', '0'},
-
-	  /* Drive cJTAG escape sequence for TAP reset - 8 TMSC edges */
-	  /* TCK=1, TMS=1, TDI=0 (rising edge of TCK with TMSC still 0) */
-	  {'1', '1', '0'},
-	  /* TCK=1, TMS=1, TDI=1 (drive rising TMSC edge) */
-	  {'1', '1', '1'},
-	  /* TCK=1, TMS=1, TDI=0 (drive falling TMSC edge) */
-	  {'1', '1', '0'},
-	  /* TCK=1, TMS=1, TDI=1 (drive rising TMSC edge) */
-	  {'1', '1', '1'},
-	  /* TCK=1, TMS=1, TDI=0 (drive falling TMSC edge) */
-	  {'1', '1', '0'},
-	  /* TCK=1, TMS=1, TDI=1 (drive rising TMSC edge) */
-	  {'1', '1', '1'},
-	  /* TCK=1, TMS=1, TDI=0 (drive falling TMSC edge) */
-	  {'1', '1', '0'},
-	  /* TCK=1, TMS=1, TDI=1 (drive rising TMSC edge) */
-	  {'1', '1', '1'},
-	  /* TCK=1, TMS=1, TDI=0 (drive falling TMSC edge) */
-	  {'1', '1', '0'},
-	  /* TCK=0, TMS=1, TDI=0 (falling edge TCK with TMSC still 0) */
-	  {'0', '1', '0'},
-
-	  /* 3 TCK pulses for padding */
-	  /* TCK=1, TMS=1, TDI=0 (drive rising TCK edge) */
-	  {'1', '1', '0'},
-	  /* TCK=0, TMS=1, TDI=0 (drive falling TCK edge) */
-	  {'0', '1', '0'},
-	  /* TCK=1, TMS=1, TDI=0 (drive rising TCK edge) */
-	  {'1', '1', '0'},
-	  /* TCK=0, TMS=1, TDI=0 (drive falling TCK edge) */
-	  {'0', '1', '0'},
-	  /* TCK=1, TMS=1, TDI=0 (drive rising TCK edge) */
-	  {'1', '1', '0'},
-	  /* TCK=0, TMS=1, TDI=0 (drive falling TCK edge) */
-	  {'0', '1', '0'},
-
-	  /* Drive cJTAG escape sequence for SELECT */
-	  /* TCK=1, TMS=1, TDI=0 (rising edge of TCK with TMSC still 0, TAP reset that was just setup occurs here too) */
-	  {'1', '1', '0'},
-	  /* TCK=1, TMS=1, TDI=1 (drive rising TMSC edge) */
-	  {'1', '1', '1'},
-	  /* TCK=1, TMS=1, TDI=0 (drive falling TMSC edge) */
-	  {'1', '1', '0'},
-	  /* TCK=1, TMS=1, TDI=1 (drive rising TMSC edge) */
-	  {'1', '1', '1'},
-	  /* TCK=1, TMS=1, TDI=0 (drive falling TMSC edge) */
-	  {'1', '1', '0'},
-	  /* TCK=1, TMS=1, TDI=1 (drive rising TMSC edge) */
-	  {'1', '1', '1'},
-	  /* TCK=1, TMS=1, TDI=0 (drive falling TMSC edge) */
-	  {'1', '1', '0'},
-	  /* TCK=0, TMS=1, TDI=0 (falling edge TCK with TMSC still 0) */
-	  {'0', '1', '0'},
-
-	  /* Drive cJTAG escape sequence for activation */
-	  /* TCK=1, TMS=1, TDI=0 (rising edge TCK with TMSC still 0... online mode activated... also OAC bit0==0) */
-	  {'1', '1', '0'},
-	  /* TCK=0, TMS=1, TDI=0 (falling edge TCK) */
-	  {'0', '1', '0'},
-	  /* TCK=1, TMS=1, TDI=0 (rising edge TCK... OAC bit1==0) */
-	  {'1', '1', '0'},
-	  /* TCK=0, TMS=1, TDI=1 (falling edge TCK) */
-	  {'0', '1', '1'},
-	  /* TCK=1, TMS=1, TDI=1 (rising edge TCK... OAC bit2==1) */
-	  {'1', '1', '1'},
-	  /* TCK=0, TMS=1, TDI=1 (falling edge TCK, TMSC stays high) */
-	  {'0', '1', '1'},
-	  /* TCK=1, TMS=1, TDI=1 (rising edge TCK... OAC bit3==1) */
-	  {'1', '1', '1'},
-	  /* TCK=0, TMS=1, TDI=0 (falling edge TCK) */
-	  {'0', '1', '0'},
-	  /* TCK=1, TMS=1, TDI=0 (rising edge TCK... EC bit0==0) */
-	  {'1', '1', '0'},
-	  /* TCK=0, TMS=1, TDI=0 (falling edge TCK) */
-	  {'0', '1', '0'},
-	  /* TCK=1, TMS=1, TDI=0 (rising edge TCK... EC bit1==0) */
-	  {'1', '1', '0'},
-	  /* TCK=0, TMS=1, TDI=0 (falling edge TCK) */
-	  {'0', '1', '0'},
-	  /* TCK=1, TMS=1, TDI=0 (rising edge TCK... EC bit2==0) */
-	  {'1', '1', '0'},
-	  /* TCK=0, TMS=1, TDI=1 (falling edge TCK) */
-	  {'0', '1', '1'},
-	  /* TCK=1, TMS=1, TDI=1 (rising edge TCK... EC bit3==1) */
-	  {'1', '1', '1'},
-	  /* TCK=0, TMS=1, TDI=0 (falling edge TCK) */
-	  {'0', '1', '0'},
-	  /* TCK=1, TMS=1, TDI=0 (rising edge TCK... CP bit0==0) */
-	  {'1', '1', '0'},
-	  /* TCK=0, TMS=1, TDI=0 (falling edge TCK) */
-	  {'0', '1', '0'},
-	  /* TCK=1, TMS=1, TDI=0 (rising edge TCK... CP bit1==0) */
-	  {'1', '1', '0'},
-	  /* TCK=0, TMS=1, TDI=0 (falling edge TCK) */
-	  {'0', '1', '0'},
-	  /* TCK=1, TMS=1, TDI=0 (rising edge TCK... CP bit2==0) */
-	  {'1', '1', '0'},
-	  /* TCK=0, TMS=1, TDI=0 (falling edge TCK) */
-	  {'0', '1', '0'},
-	  /* TCK=1, TMS=1, TDI=0 (rising edge TCK... CP bit3==0) */
-	  {'1', '1', '0'},
-	};
-
-
-	if (!oscan1_mode)
-		return;
-
-
-	if (!tck) {
-		LOG_ERROR("Can't run cJTAG online/activate escape sequences: TCK signal is not defined");
-		return;
-	}
-
-	if (!tdi) {
-		LOG_ERROR("Can't run cJTAG online/activate escape sequences: TDI signal is not defined");
-		return;
-	}
-
-	if (!tms) {
-		LOG_ERROR("Can't run cJTAG online/activate escape sequences: TMS signal is not defined");
-		return;
-	}
-
-	if (!tdo) {
-		LOG_ERROR("Can't run cJTAG online/activate escape sequences: TDO signal is not defined");
-		return;
-	}
-
-	/* Send the sequence to the adapter */
-	for (size_t i = 0; i < sizeof(sequence)/sizeof(sequence[0]); i++)
-		oscan1_set_tck_tms_tdi(tck, sequence[i].tck, tms, sequence[i].tms, tdi, sequence[i].tdi);
-
-	ftdi_get_signal(tdo, &tdovalue);  /* Just to force a flush */
-}
-
-#endif /* #if BUILD_FTDI_OSCAN1 == 1 */
 
 COMMAND_HANDLER(ftdi_handle_device_desc_command)
 {
@@ -1274,19 +1062,6 @@ COMMAND_HANDLER(ftdi_handle_tdo_sample_edge_command)
 	return ERROR_OK;
 }
 
-#if BUILD_FTDI_OSCAN1 == 1
-COMMAND_HANDLER(ftdi_handle_oscan1_mode_command)
-{
-	if (CMD_ARGC > 1)
-		return ERROR_COMMAND_SYNTAX_ERROR;
-
-	if (CMD_ARGC == 1)
-		COMMAND_PARSE_ON_OFF(CMD_ARGV[0], oscan1_mode);
-
-	command_print(CMD, "oscan1 mode: %s.", oscan1_mode ? "on" : "off");
-	return ERROR_OK;
-}
-#endif
 
 static const struct command_registration ftdi_command_handlers[] = {
 	{
@@ -1356,15 +1131,7 @@ static const struct command_registration ftdi_command_handlers[] = {
 			"allow signalling speed increase)",
 		.usage = "(rising|falling)",
 	},
-#if BUILD_FTDI_OSCAN1 == 1
-	{
-		.name = "ftdi_oscan1_mode",
-		.handler = &ftdi_handle_oscan1_mode_command,
-		.mode = COMMAND_ANY,
-		.help = "set to 'on' to use OSCAN1 mode for signaling, otherwise 'off' (default is 'off')",
-		.usage = "(on|off)",
-	},
-#endif
+
 	COMMAND_REGISTRATION_DONE
 };
 
@@ -1598,7 +1365,7 @@ static const struct swd_driver ftdi_swd = {
 	.run = ftdi_swd_run_queue,
 };
 
-static const char * const ftdi_transports[] = { "jtag", "swd", NULL };
+static const char * const ftdi_transports[] = { "jtag", "swd", "cjtag",NULL};
 
 static struct jtag_interface ftdi_interface = {
 	.supported = DEBUG_CAP_TMS_SEQ,
@@ -1620,3 +1387,958 @@ struct adapter_driver ftdi_adapter_driver = {
 	.jtag_ops = &ftdi_interface,
 	.swd_ops = &ftdi_swd,
 };
+
+static void oscan1_set_tck_tms_tdi(struct signal* tck, char tckvalue, struct signal* tms,
+   char tmsvalue, struct signal* tdi, char tdivalue)
+{
+   ftdi_set_signal(tms, tmsvalue);
+   ftdi_set_signal(tdi, tdivalue);
+   ftdi_set_signal(tck, tckvalue);
+}
+
+static void oscan1_reset_online_activate(void)
+{
+   /* After TAP reset, the OSCAN1-to-JTAG adapter is in offline and
+   non-activated state.  Escape sequences are needed to bring
+   the TAP online and activated into OSCAN1 mode. */
+
+   struct signal* tck = find_signal_by_name("TCK");
+   struct signal* tdi = find_signal_by_name("TDI");
+   struct signal* tms = find_signal_by_name("TMS");
+   struct signal* tdo = find_signal_by_name("TDO");
+   uint16_t tdovalue;
+
+   static const struct {
+      int8_t tck;
+      int8_t tms;
+      int8_t tdi;
+   } sequence[] = {
+      /* TCK=0, TMS=1, TDI=0 (drive TMSC to 0 baseline) */
+      {'0', '1', '0'},
+
+      /* Drive cJTAG escape sequence for TAP reset - 8 TMSC edges */
+      /* TCK=1, TMS=1, TDI=0 (rising edge of TCK with TMSC still 0) */
+      {'1', '1', '0'},
+      /* TCK=1, TMS=1, TDI=1 (drive rising TMSC edge) */
+      {'1', '1', '1'},
+      /* TCK=1, TMS=1, TDI=0 (drive falling TMSC edge) */
+      {'1', '1', '0'},
+      /* TCK=1, TMS=1, TDI=1 (drive rising TMSC edge) */
+      {'1', '1', '1'},
+      /* TCK=1, TMS=1, TDI=0 (drive falling TMSC edge) */
+      {'1', '1', '0'},
+      /* TCK=1, TMS=1, TDI=1 (drive rising TMSC edge) */
+      {'1', '1', '1'},
+      /* TCK=1, TMS=1, TDI=0 (drive falling TMSC edge) */
+      {'1', '1', '0'},
+      /* TCK=1, TMS=1, TDI=1 (drive rising TMSC edge) */
+      {'1', '1', '1'},
+      /* TCK=1, TMS=1, TDI=0 (drive falling TMSC edge) */
+      {'1', '1', '0'},
+      /* TCK=0, TMS=1, TDI=0 (falling edge TCK with TMSC still 0) */
+      {'0', '1', '0'},
+
+      /* 3 TCK pulses for padding */
+      /* TCK=1, TMS=1, TDI=0 (drive rising TCK edge) */
+      {'1', '1', '0'},
+      /* TCK=0, TMS=1, TDI=0 (drive falling TCK edge) */
+      {'0', '1', '0'},
+      /* TCK=1, TMS=1, TDI=0 (drive rising TCK edge) */
+      {'1', '1', '0'},
+      /* TCK=0, TMS=1, TDI=0 (drive falling TCK edge) */
+      {'0', '1', '0'},
+      /* TCK=1, TMS=1, TDI=0 (drive rising TCK edge) */
+      {'1', '1', '0'},
+      /* TCK=0, TMS=1, TDI=0 (drive falling TCK edge) */
+      {'0', '1', '0'},
+
+      /* Drive cJTAG escape sequence for SELECT */
+      /* TCK=1, TMS=1, TDI=0 (rising edge of TCK with TMSC still 0, TAP reset that was just setup occurs here too) */
+      {'1', '1', '0'},
+      /* TCK=1, TMS=1, TDI=1 (drive rising TMSC edge) */
+      {'1', '1', '1'},
+      /* TCK=1, TMS=1, TDI=0 (drive falling TMSC edge) */
+      {'1', '1', '0'},
+      /* TCK=1, TMS=1, TDI=1 (drive rising TMSC edge) */
+      {'1', '1', '1'},
+      /* TCK=1, TMS=1, TDI=0 (drive falling TMSC edge) */
+      {'1', '1', '0'},
+      /* TCK=1, TMS=1, TDI=1 (drive rising TMSC edge) */
+      {'1', '1', '1'},
+      /* TCK=1, TMS=1, TDI=0 (drive falling TMSC edge) */
+      {'1', '1', '0'},
+      /* TCK=0, TMS=1, TDI=0 (falling edge TCK with TMSC still 0) */
+      {'0', '1', '0'},
+
+      /* Drive cJTAG escape sequence for activation */
+      /* TCK=1, TMS=1, TDI=0 (rising edge TCK with TMSC still 0... online mode activated... also OAC bit0==0) */
+      {'1', '1', '0'},
+      /* TCK=0, TMS=1, TDI=0 (falling edge TCK) */
+      {'0', '1', '0'},
+      /* TCK=1, TMS=1, TDI=0 (rising edge TCK... OAC bit1==0) */
+      {'1', '1', '0'},
+      /* TCK=0, TMS=1, TDI=1 (falling edge TCK) */
+      {'0', '1', '1'},
+      /* TCK=1, TMS=1, TDI=1 (rising edge TCK... OAC bit2==1) */
+      {'1', '1', '1'},
+      /* TCK=0, TMS=1, TDI=1 (falling edge TCK, TMSC stays high) */
+      {'0', '1', '1'},
+      /* TCK=1, TMS=1, TDI=1 (rising edge TCK... OAC bit3==1) */
+      {'1', '1', '1'},
+      /* TCK=0, TMS=1, TDI=0 (falling edge TCK) */
+      {'0', '1', '0'},
+      /* TCK=1, TMS=1, TDI=0 (rising edge TCK... EC bit0==0) */
+      {'1', '1', '0'},
+      /* TCK=0, TMS=1, TDI=0 (falling edge TCK) */
+      {'0', '1', '0'},
+      /* TCK=1, TMS=1, TDI=0 (rising edge TCK... EC bit1==0) */
+      {'1', '1', '0'},
+      /* TCK=0, TMS=1, TDI=0 (falling edge TCK) */
+      {'0', '1', '0'},
+      /* TCK=1, TMS=1, TDI=0 (rising edge TCK... EC bit2==0) */
+      {'1', '1', '0'},
+      /* TCK=0, TMS=1, TDI=1 (falling edge TCK) */
+      {'0', '1', '1'},
+      /* TCK=1, TMS=1, TDI=1 (rising edge TCK... EC bit3==1) */
+      {'1', '1', '1'},
+      /* TCK=0, TMS=1, TDI=0 (falling edge TCK) */
+      {'0', '1', '0'},
+      /* TCK=1, TMS=1, TDI=0 (rising edge TCK... CP bit0==0) */
+      {'1', '1', '0'},
+      /* TCK=0, TMS=1, TDI=0 (falling edge TCK) */
+      {'0', '1', '0'},
+      /* TCK=1, TMS=1, TDI=0 (rising edge TCK... CP bit1==0) */
+      {'1', '1', '0'},
+      /* TCK=0, TMS=1, TDI=0 (falling edge TCK) */
+      {'0', '1', '0'},
+      /* TCK=1, TMS=1, TDI=0 (rising edge TCK... CP bit2==0) */
+      {'1', '1', '0'},
+      /* TCK=0, TMS=1, TDI=0 (falling edge TCK) */
+      {'0', '1', '0'},
+      /* TCK=1, TMS=1, TDI=0 (rising edge TCK... CP bit3==0) */
+      {'1', '1', '0'},
+   };
+
+
+
+
+   if (!tck) {
+      LOG_ERROR("Can't run cJTAG online/activate escape sequences: TCK signal is not defined");
+      return;
+   }
+
+   if (!tdi) {
+      LOG_ERROR("Can't run cJTAG online/activate escape sequences: TDI signal is not defined");
+      return;
+   }
+
+   if (!tms) {
+      LOG_ERROR("Can't run cJTAG online/activate escape sequences: TMS signal is not defined");
+      return;
+   }
+
+   if (!tdo) {
+      LOG_ERROR("Can't run cJTAG online/activate escape sequences: TDO signal is not defined");
+      return;
+   }
+
+   /* Send the sequence to the adapter */
+   for (size_t i = 0; i < sizeof(sequence) / sizeof(sequence[0]); i++)
+      oscan1_set_tck_tms_tdi(tck, sequence[i].tck, tms, sequence[i].tms, tdi, sequence[i].tdi);
+
+   ftdi_get_signal(tdo, &tdovalue);  /* Just to force a flush */
+}
+/**
+* Initializes the cJTAG interface
+* @param ctx is a pointer to the mpsse_ctx context.
+*/
+void cjtag_initialize(struct mpsse_ctx* ctx)
+{
+   uint8_t ucResponse;
+
+      tycJtagScanFormat = normal;
+      iWantResult = 1;
+      ulTxCount = 0;
+
+      /* Keep a copy of the mpsse_ctx...*/
+      local_ctx = ctx;
+      /* Flush anything in the queue... */
+      mpsse_flush(mpsse_ctx);
+      mpsse_purge(mpsse_ctx);
+      /* Initialize the FTDI chip pins state...*/
+      mpsse_write(local_ctx, puOPLDcInitializeSequence, ARRAY_SIZE(puOPLDcInitializeSequence));
+      mpsse_read(local_ctx, &ucResponse, 1);
+      /* Issue the escape sequence...*/
+      oscan1_reset_online_activate();          
+      tycJtagScanFormat = oscan1;
+      transitions("0111110", TDI_0);
+      tap_set_state(TAP_IDLE);
+
+}
+
+/**
+* Performs a cJTAG scan
+* @param cmd contains the JTAG scan command to perform.
+*/
+void cjtag_execute_scan(struct jtag_command* cmd)
+{
+   uint32_t i;
+   uint8_t ucTDI = 0;
+   uint32_t ulPreamble = 0;
+   //to send data to target
+   uint8_t* prepared_outbuffer = NULL;
+   uint8_t zero_buf[16], one_buf = 0xff;
+   //to receive data from target
+   uint8_t* inbuffer = NULL;
+   memset(zero_buf, 0x00, 16);
+   /*
+   if (cmd->cmd.scan->num_fields != 1) {
+       //LOG_ERROR("Unexpected field size of %d", cmd->cmd.scan->num_fields);
+       return;
+   }
+   */
+   struct scan_field* field = cmd->cmd.scan->fields;
+   uint32_t scan_size = 0;
+   if (cmd->cmd.scan->num_fields > 1)
+   {
+      //prepare multi-tap buffer here.
+      //CJTAG implementation does not support seperate multi-tap MPSSE commands as in the case of JTAG mode
+      prepared_outbuffer = (uint8_t*)malloc(MAX_SUPPORTED_SCAN_LENGTH - (MAX_PREAMBLE + MAX_POSTAMBLE));
+      inbuffer = (uint8_t*)malloc(MAX_SUPPORTED_SCAN_LENGTH - (MAX_PREAMBLE + MAX_POSTAMBLE));
+      for (i = 0; i < (uint32_t)cmd->cmd.scan->num_fields; i++, field++) {
+         if (cmd->cmd.scan->ir_scan)
+         {
+            bit_copy(prepared_outbuffer, scan_size, field->out_value, 0, field->num_bits);
+         }
+         else {
+            if (field->out_value)
+            {
+               //there is data to the dr scan
+               bit_copy(prepared_outbuffer, scan_size, field->out_value, 0, field->num_bits);
+            }
+            else {
+               if (1 == field->num_bits)
+                  //considered as tap under bypass
+                  bit_copy(prepared_outbuffer, scan_size, &one_buf, 0, field->num_bits);
+               else
+                  //if not bypass and no input buffer, fill zeros
+                  bit_copy(prepared_outbuffer, scan_size, zero_buf, 0, field->num_bits);
+
+            }
+         }
+         scan_size += field->num_bits;
+      }
+   }
+   else
+   {
+      prepared_outbuffer = (uint8_t*)field->out_value;
+      inbuffer = field->in_value;
+      scan_size = field->num_bits;
+   }
+
+
+   if ((scan_size + MAX_PREAMBLE + MAX_POSTAMBLE) > MAX_SUPPORTED_SCAN_LENGTH) {
+      //LOG_ERROR("Scan length too long at %d", field->num_bits);
+      return;
+   }
+
+   ulTxCount = 0;
+
+   if (cmd->cmd.scan->ir_scan) {
+      if (tap_get_state() != TAP_IRSHIFT)
+         cjtag_move_to_state(TAP_IRSHIFT);
+   }
+   else {
+      if (tap_get_state() != TAP_DRSHIFT)
+         cjtag_move_to_state(TAP_DRSHIFT);
+   }
+
+   ulPreamble = ulTxCount;
+
+   tap_set_end_state(cmd->cmd.scan->end_state);
+
+   for (i = 0; i < scan_size - 1; i++) {
+      if (prepared_outbuffer)
+         bit_copy(&ucTDI, 0, prepared_outbuffer, i, 1);
+
+      if (ucTDI)
+         send_JTAG(TMS_0 | TDI_1);
+      else
+         send_JTAG(TMS_0 | TDI_0);
+   }
+
+
+   if (prepared_outbuffer)
+      bit_copy(&ucTDI, 0, prepared_outbuffer, i, 1);
+
+   if (ucTDI)
+      send_JTAG(TMS_1 | TDI_1);
+   else
+      send_JTAG(TMS_1 | TDI_0);
+
+
+   if (cmd->cmd.scan->ir_scan)
+      tap_set_state(TAP_IREXIT1);
+   else
+      tap_set_state(TAP_DREXIT1);
+
+   /* Move to the end state... */
+   cjtag_move_to_state(cmd->cmd.scan->end_state);
+
+   /* Perform the scan... */
+   mpsse_read(local_ctx, pucRxBuffer, scan_size + ulTxCount);
+
+   if (inbuffer) {
+      for (i = 0; i < scan_size; i++) {
+         bit_copy(inbuffer, i, (const uint8_t*)&pucRxBuffer[i + ulPreamble], 7, 1);
+      }
+   }
+
+   if (cmd->cmd.scan->num_fields > 1)
+   {
+      //exract data from multi-tap buffer here.
+      // usually we do not have in_value in IR scan during multi-tap configuration scan
+      if (!cmd->cmd.scan->ir_scan)
+      {
+         field = cmd->cmd.scan->fields;
+         scan_size = 0;
+         for (i = 0; i < (uint32_t)cmd->cmd.scan->num_fields; i++, field++) {
+
+            if (field->in_value)
+            {
+               bit_copy(field->in_value, 0, inbuffer, scan_size, field->num_bits);
+            }
+            scan_size += field->num_bits;
+         }
+      }
+      free(prepared_outbuffer);
+      free(inbuffer);
+   }
+}
+
+/**
+* Sends the JTAG state machine to the idle state
+*/
+static void set_JTAG_to_idle(void)
+{
+   /* Go to idle...*/
+   transitions("0111110", TDI_0);
+
+   if (!in_normal_scan_mode()) {
+      /* Go back to 2wire mode.  We've destroyed things in RTI.*/
+      set_format(normal);
+      set_JTAG_to_idle();
+      enter_2wire_mode();
+   }
+}
+
+/**
+* Performs TMS transitions to get to a required state.
+* @param tms_values contains a string of TMS transitions to send.
+* @param tdi_value contains a dixed TDI value to send.
+*/
+static void transitions(const char* tms_values, int tdi_value)
+{
+   uint8_t pucBuffer[0x100];
+   unsigned char ucCount = 0;
+
+   ulTxCount = 0;
+
+   /* Take a string of 1s and 0s (tms_values) and execute transitions
+      with them.  TDI is held fixed. */
+   for (const char* p = tms_values; *p; p++) {
+      if (*p == '_' || *p == ' ')
+         continue;
+
+      ulTxCount++;
+
+      if (iWantResult && in_normal_scan_mode()) {
+         pucBuffer[ucCount++] = 0x6F;
+         pucBuffer[ucCount++] = 0x00;
+         if (*p == '1')
+            pucBuffer[ucCount++] = 0x01;
+         else
+            pucBuffer[ucCount++] = 0x00;
+      }
+      else if (!iWantResult && in_normal_scan_mode()) {
+         pucBuffer[ucCount++] = 0x4B;
+         pucBuffer[ucCount++] = 0x00;
+         if (*p == '1')
+            pucBuffer[ucCount++] = 0x01;
+         else
+            pucBuffer[ucCount++] = 0x00;
+      }
+      else {
+         if (*p == '1') {
+            pucBuffer[ucCount++] = 0x1B;
+            pucBuffer[ucCount++] = 0x00;
+            pucBuffer[ucCount++] = 0x03;
+
+            pucBuffer[ucCount++] = 0x97;
+            pucBuffer[ucCount++] = 0x97;
+            pucBuffer[ucCount++] = 0x97;
+
+            pucBuffer[ucCount++] = 0x80;
+            pucBuffer[ucCount++] = 0x63;
+            pucBuffer[ucCount++] = 0xFB;
+            pucBuffer[ucCount++] = 0x82;
+            pucBuffer[ucCount++] = 0x0B;
+            pucBuffer[ucCount++] = 0xFF;
+
+            pucBuffer[ucCount++] = 0x97;
+
+            pucBuffer[ucCount++] = 0x80;
+            pucBuffer[ucCount++] = 0x62;
+            pucBuffer[ucCount++] = 0xFB;
+            pucBuffer[ucCount++] = 0x82;
+            pucBuffer[ucCount++] = 0x01;
+            pucBuffer[ucCount++] = 0xFF;
+
+            pucBuffer[ucCount++] = 0x2A;
+            pucBuffer[ucCount++] = 0x00;
+
+            pucBuffer[ucCount++] = 0x80;
+            pucBuffer[ucCount++] = 0x62;
+            pucBuffer[ucCount++] = 0xFB;
+            pucBuffer[ucCount++] = 0x82;
+            pucBuffer[ucCount++] = 0x03;
+            pucBuffer[ucCount++] = 0xFF;
+         }
+         else {
+            pucBuffer[ucCount++] = 0x1B;
+            pucBuffer[ucCount++] = 0x00;
+            pucBuffer[ucCount++] = 0x01;
+
+            pucBuffer[ucCount++] = 0x97;
+            pucBuffer[ucCount++] = 0x97;
+            pucBuffer[ucCount++] = 0x97;
+
+            pucBuffer[ucCount++] = 0x80;
+            pucBuffer[ucCount++] = 0x61;
+            pucBuffer[ucCount++] = 0xFB;
+            pucBuffer[ucCount++] = 0x82;
+            pucBuffer[ucCount++] = 0x0B;
+            pucBuffer[ucCount++] = 0xFF;
+
+            pucBuffer[ucCount++] = 0x97;
+
+            pucBuffer[ucCount++] = 0x80;
+            pucBuffer[ucCount++] = 0x60;
+            pucBuffer[ucCount++] = 0xFB;
+            pucBuffer[ucCount++] = 0x82;
+            pucBuffer[ucCount++] = 0x01;
+            pucBuffer[ucCount++] = 0xFF;
+
+            pucBuffer[ucCount++] = 0x2A;
+            pucBuffer[ucCount++] = 0x00;
+
+            pucBuffer[ucCount++] = 0x80;
+            pucBuffer[ucCount++] = 0x60;
+            pucBuffer[ucCount++] = 0xFB;
+            pucBuffer[ucCount++] = 0x82;
+            pucBuffer[ucCount++] = 0x03;
+            pucBuffer[ucCount++] = 0xFF;
+         }
+      }
+   }
+
+   if (iWantResult && in_normal_scan_mode()) {
+      pucBuffer[ucCount++] = 0x87;
+   }
+   else if (!iWantResult && in_normal_scan_mode()) {
+      pucBuffer[ucCount++] = 0x81;
+      pucBuffer[ucCount++] = 0x87;
+   }
+   else {
+      pucBuffer[ucCount++] = 0x87;
+   }
+
+   mpsse_write(local_ctx, pucBuffer, ucCount);
+
+   if (!iWantResult && in_normal_scan_mode()) {
+      mpsse_read(local_ctx, pucRxBuffer, 1);
+   }
+   else {
+      mpsse_read(local_ctx, pucRxBuffer, ulTxCount);
+   }
+}
+
+/**
+* Performs a zero-bit-scan sequence from idle and back to idle.
+* @param repeat contains the repeat count for the zero-bit-scan sequence.
+*/
+static void zero_bit_scan_sequence(int repeat)
+{
+   /* Perform a zero-bit-scan sequence from idle and back to idle.
+      rti, sds, cdr, sdr, exit-dr, update-dr, rti. */
+   char buf[1024], * bp = buf; *bp = 0;
+
+   /* Verify that the repeat parameter is within bounds */
+   assert(repeat <= 10);
+
+   for (int i = 0; i < repeat; i++) {
+      strcat(bp, "10");   /* enter capture-DR from RTI or SDS */
+      strcat(bp, "11_");  /* exit, update. */
+   }
+   /* Now go to RTI. */
+   strcat(bp, "0");
+
+   transitions(buf, TDI_0);
+}
+
+/**
+* Perform a nonzero-bit-scan sequence from idle and back to idle.
+* @param amount contains the amount of shifts in shift-DR state.
+*/
+static void non_zero_bit_scan_sequence(unsigned amount)
+{
+   /* Perform a nonzero-bit-scan sequence from idle and back to idle.
+      amount might == 0.
+      rti, sds, cdr, sdr, exit-dr, update-dr, rti.
+      It is OK to go to RTI after the bit scan, even though
+      not necessary.  But don't go to TLR!  That will break the logic. */
+   char buf[1024], * bp = buf;
+
+   /* Verify that the amount parameter is within bounds */
+   assert(amount <= 10);
+
+   /* A transition from shift-DR does a shift.  So to have a zero_bit_scan_sequence,
+      do not enter shift-DR at all. */
+   strcpy(bp, "10_");   /* enter capture-DR */
+   bp = bp + strlen(bp);
+   /* Now cycle around shift-DR.  Each time you touch shift-DR
+      counts as 1. */
+   for (unsigned int i = 0; i < amount; i++)
+      *bp++ = '0';
+   /* Now go to update and RTI. */
+   strcpy(bp, "_110");
+   transitions(buf, TDI_0);
+}
+
+/**
+* Enters the specified control mode.
+* @param level contains the control mode level to enter.
+*/
+static void enter_control_mode(int level)
+{
+   /* Enter control level with multiple ZBS's in a row. */
+   zero_bit_scan_sequence(level);
+
+   /* Next you must lock control level. */
+   non_zero_bit_scan_sequence(1);   /* non-zero bit scan, count 1. */
+
+   transitions("000", TDI_0);
+}
+
+/**
+* Sends a two part command to the device.
+* @param opcode contains the opcode to send.
+* @param operand contains the operand to send.
+*/
+static void send_2part_command(unsigned opcode, unsigned operand)
+{
+   non_zero_bit_scan_sequence(opcode);
+   non_zero_bit_scan_sequence(operand);
+
+   /* If we are currently in oscan1 mode... */
+   if (tycJtagScanFormat == oscan1) {
+      /* ...send a checkpacket. */
+      check_packet();
+   }
+}
+
+/**
+* Low level cJTAG cycle for scan commands.
+* @param tms_and_tdi contains the TMS / TDI values to send.
+*/
+static void send_JTAG(unsigned tms_and_tdi)
+{
+   uint8_t pucBuffer[0x100];
+   uint8_t ucCount = 0;
+
+   pucBuffer[ucCount++] = 0x1B;
+   pucBuffer[ucCount++] = 0x00;
+   if (tms_and_tdi == (TMS_0 | TDI_0))
+      pucBuffer[ucCount++] = 0x01;
+   else if (tms_and_tdi == (TMS_0 | TDI_1))
+      pucBuffer[ucCount++] = 0x00;
+   else if (tms_and_tdi == (TMS_1 | TDI_0))
+      pucBuffer[ucCount++] = 0x03;
+   else if (tms_and_tdi == (TMS_1 | TDI_1))
+      pucBuffer[ucCount++] = 0x02;
+
+   pucBuffer[ucCount++] = 0x97;
+   pucBuffer[ucCount++] = 0x97;
+   pucBuffer[ucCount++] = 0x97;
+
+   pucBuffer[ucCount++] = 0x80;
+   if (tms_and_tdi == (TMS_0 | TDI_0))
+      pucBuffer[ucCount++] = 0x61;
+   else if (tms_and_tdi == (TMS_0 | TDI_1))
+      pucBuffer[ucCount++] = 0x61;
+   else if (tms_and_tdi == (TMS_1 | TDI_0))
+      pucBuffer[ucCount++] = 0x63;
+   else if (tms_and_tdi == (TMS_1 | TDI_1))
+      pucBuffer[ucCount++] = 0x63;
+   pucBuffer[ucCount++] = 0xFB;
+   pucBuffer[ucCount++] = 0x82;
+   pucBuffer[ucCount++] = 0x0B;
+   pucBuffer[ucCount++] = 0xFF;
+
+   pucBuffer[ucCount++] = 0x97;
+
+   pucBuffer[ucCount++] = 0x80;
+   if (tms_and_tdi == (TMS_0 | TDI_0))
+      pucBuffer[ucCount++] = 0x60;
+   else if (tms_and_tdi == (TMS_0 | TDI_1))
+      pucBuffer[ucCount++] = 0x60;
+   else if (tms_and_tdi == (TMS_1 | TDI_0))
+      pucBuffer[ucCount++] = 0x62;
+   else if (tms_and_tdi == (TMS_1 | TDI_1))
+      pucBuffer[ucCount++] = 0x62;
+   pucBuffer[ucCount++] = 0xFB;
+   pucBuffer[ucCount++] = 0x82;
+   pucBuffer[ucCount++] = 0x01;
+   pucBuffer[ucCount++] = 0xFF;
+
+   pucBuffer[ucCount++] = 0x2A;
+   pucBuffer[ucCount++] = 0x00;
+
+   pucBuffer[ucCount++] = 0x80;
+   if (tms_and_tdi == (TMS_0 | TDI_0))
+      pucBuffer[ucCount++] = 0x60;
+   else if (tms_and_tdi == (TMS_0 | TDI_1))
+      pucBuffer[ucCount++] = 0x60;
+   else if (tms_and_tdi == (TMS_1 | TDI_0))
+      pucBuffer[ucCount++] = 0x62;
+   else if (tms_and_tdi == (TMS_1 | TDI_1))
+      pucBuffer[ucCount++] = 0x62;
+   pucBuffer[ucCount++] = 0xFB;
+   pucBuffer[ucCount++] = 0x82;
+   pucBuffer[ucCount++] = 0x03;
+   pucBuffer[ucCount++] = 0xFF;
+
+   mpsse_write(local_ctx, pucBuffer, ucCount);
+}
+
+/**
+* Sends a dummy packet to the device
+*/
+static void dummy_scan_packet(void)
+{
+   transitions("0", TDI_0);
+}
+
+/**
+* Sends a check packet to the device
+*/
+static void send_check_packet(void)
+{
+   uint8_t pucBuffer[3];
+   unsigned char ucCount = 0;
+
+   if (in_normal_scan_mode())
+      pucBuffer[ucCount++] = 0x4B;
+   else
+      pucBuffer[ucCount++] = 0x1B;
+   pucBuffer[ucCount++] = 0x03;
+   pucBuffer[ucCount++] = 0x00;
+
+   mpsse_write(local_ctx, pucBuffer, ucCount);
+}
+
+/**
+*  Sends a check packet to the device
+*/
+static void check_packet(void)
+{
+   /* dummy RTI->RTI when in oscan1. */
+   bool in_oscan1 = !in_normal_scan_mode();
+   if (in_oscan1)
+   {
+      dummy_scan_packet();
+      /* From pranab:
+      IEEE Std 1149.7-2009
+      - Section "21.7: TAPC state/packet relationships"
+      - with "Figure 21-9 - Typical DTS-initiated packet sequences and APU state transitions"
+      contains the picture I created earlier for Check packets & Dummy scan packets.
+      */
+   }
+   send_check_packet();
+}
+
+/**
+*  Enters oscan1 mode.
+*/
+static void enter_oscan1(void)
+{
+   /* Enter the command STFMT MODE
+      where :
+      parameter STFMT    = 5'h03;  Store Format
+      parameter TAP7_OSCAN1 = 5'h9; */
+   send_2part_command(STFMT, OSCAN1);
+   /* After the command, must send a check packet */
+   check_packet();
+   /* Now in oscan1.  Port must know this. */
+   set_format(oscan1);
+}
+
+/**
+* Enters 2 wire_mode
+* @return 1: Success, 0 : Failure
+*/
+#if 0
+static int enter_2wire_mode_and_test(void)
+{
+   int wr = want_result(0);
+
+   set_JTAG_to_idle();
+
+   /* Ahead of discovery, enter 2wire mode, and discover in that mode.
+      All JTAGs should be set to idle at this point. */
+   enter_control_mode(2);
+
+   /* cl 2 should now be locked and the arcs disconnected.
+      The 2wire device has now disconnected the ARCs. */
+   enter_oscan1();
+
+   /* Get out of disconnected state by going to IR and RTI
+      Now reconnect the arcs by entering shift-IR and then back to
+      RTI. */
+   transitions("1100110", TDI_0);
+
+   /* Now we can continue discovering the ARCs. */
+   want_result(wr);
+   return 1;
+}
+#endif
+
+/**
+* Checks if we are in normal / oscan1 mode.
+* @return TRUE : Normal scan mode, FALSE : oscan1 mode.
+*/
+static bool in_normal_scan_mode(void)
+{
+   return tycJtagScanFormat == normal;
+}
+
+/**
+* Sets the current scan mode.
+* @param sf contains the Scan mode format
+*/
+static void set_format(TycJtagScanFormat sf)
+{
+   uint8_t normalFormatSeq[] = {
+      0x80,0xA0,0xEB,
+      0x82,0x60,0x60,
+      0x80,0xA0,0xEB,
+      0x82,0x00,0x60,
+      0x80,0xE0,0xEB,
+      0x82,0x00,0x60
+   };
+   uint8_t oscan1FormatSeq[] = {
+      0x80,0x60,0xFB,
+      0x82,0x00,0xFF,
+      0x80,0x60,0xFB,
+      0x82,0x03,0xFF,
+      0x80,0x60,0xFB,
+      0x82,0x03,0xFF
+   };
+
+   if (sf == tycJtagScanFormat)
+      return;
+
+   if (sf == normal) {
+      mpsse_write(local_ctx, normalFormatSeq, ARRAY_SIZE(normalFormatSeq));
+   }
+   else if (sf == oscan1) {
+      mpsse_write(local_ctx, oscan1FormatSeq, ARRAY_SIZE(oscan1FormatSeq));
+   }
+
+   tycJtagScanFormat = sf;
+}
+
+/**
+* Helper function to set/get whether result is required.
+* @param wr : 1 Result required, 0 : No result required.
+* @return Previous wr value.
+*/
+static int want_result(int wr)
+{
+   int ret = iWantResult;
+   iWantResult = wr;
+   return ret;
+}
+
+/**
+* Enters two wire mode.
+*/
+static void enter_2wire_mode(void)
+{
+   int wr = want_result(0);
+
+   set_JTAG_to_idle();
+   enter_control_mode(2);
+   enter_oscan1();
+   /* exit command level so we can reconnect arcs.*/
+   send_2part_command(STMC, EXIT_CMD_LVL);
+   want_result(wr);
+}
+
+/**
+* Performs TMS transitions to get to a required state.
+* Optimised version of the transitions() function where reads
+* are not done until tthe end of the scan.
+* @param tms_values contains a string of TMS transitions to send.
+* @param tdi_value contains the fixed TDI value to send.
+*/
+static void cjtag_transitions(const char* tms_values, int tdi_value)
+{
+   uint8_t pucBuffer[0x100];
+   unsigned char ucCount = 0;
+
+   /* Take a string of 1s and 0s (tms_values) and execute transitions
+      with them.  TDI is held fixed. */
+   for (const char* p = tms_values; *p; p++) {
+
+      if (*p == '_' || *p == ' ')
+         continue;
+
+      ulTxCount++;
+
+      if (*p == '1') {
+         pucBuffer[ucCount++] = 0x1B;
+         pucBuffer[ucCount++] = 0x00;
+         pucBuffer[ucCount++] = 0x03;
+
+         pucBuffer[ucCount++] = 0x97;
+         pucBuffer[ucCount++] = 0x97;
+         pucBuffer[ucCount++] = 0x97;
+
+         pucBuffer[ucCount++] = 0x80;
+         pucBuffer[ucCount++] = 0x63;
+         pucBuffer[ucCount++] = 0xFB;
+         pucBuffer[ucCount++] = 0x82;
+         pucBuffer[ucCount++] = 0x0B;
+         pucBuffer[ucCount++] = 0xFF;
+
+         pucBuffer[ucCount++] = 0x97;
+
+         pucBuffer[ucCount++] = 0x80;
+         pucBuffer[ucCount++] = 0x62;
+         pucBuffer[ucCount++] = 0xFB;
+         pucBuffer[ucCount++] = 0x82;
+         pucBuffer[ucCount++] = 0x01;
+         pucBuffer[ucCount++] = 0xFF;
+
+         pucBuffer[ucCount++] = 0x2A;
+         pucBuffer[ucCount++] = 0x00;
+
+         pucBuffer[ucCount++] = 0x80;
+         pucBuffer[ucCount++] = 0x62;
+         pucBuffer[ucCount++] = 0xFB;
+         pucBuffer[ucCount++] = 0x82;
+         pucBuffer[ucCount++] = 0x03;
+         pucBuffer[ucCount++] = 0xFF;
+      }
+      else {
+         pucBuffer[ucCount++] = 0x1B;
+         pucBuffer[ucCount++] = 0x00;
+         pucBuffer[ucCount++] = 0x01;
+
+         pucBuffer[ucCount++] = 0x97;
+         pucBuffer[ucCount++] = 0x97;
+         pucBuffer[ucCount++] = 0x97;
+
+         pucBuffer[ucCount++] = 0x80;
+         pucBuffer[ucCount++] = 0x61;
+         pucBuffer[ucCount++] = 0xFB;
+         pucBuffer[ucCount++] = 0x82;
+         pucBuffer[ucCount++] = 0x0B;
+         pucBuffer[ucCount++] = 0xFF;
+
+         pucBuffer[ucCount++] = 0x97;
+
+         pucBuffer[ucCount++] = 0x80;
+         pucBuffer[ucCount++] = 0x60;
+         pucBuffer[ucCount++] = 0xFB;
+         pucBuffer[ucCount++] = 0x82;
+         pucBuffer[ucCount++] = 0x01;
+         pucBuffer[ucCount++] = 0xFF;
+
+         pucBuffer[ucCount++] = 0x2A;
+         pucBuffer[ucCount++] = 0x00;
+
+         pucBuffer[ucCount++] = 0x80;
+         pucBuffer[ucCount++] = 0x60;
+         pucBuffer[ucCount++] = 0xFB;
+         pucBuffer[ucCount++] = 0x82;
+         pucBuffer[ucCount++] = 0x03;
+         pucBuffer[ucCount++] = 0xFF;
+      }
+   }
+   mpsse_write(local_ctx, pucBuffer, ucCount);
+}
+
+/**
+* Moves to the requied jtag state in 2 wire mode.
+* @param goal_state contains the destination JTAG state,
+*/
+static void cjtag_move_to_state(tap_state_t goal_state)
+{
+   tap_state_t start_state = tap_get_state();
+
+   switch (start_state) {
+   case TAP_IDLE:
+      if (goal_state == TAP_DRSHIFT)
+         cjtag_transitions("100", TDI_0);
+      else if (goal_state == TAP_IRSHIFT)
+         cjtag_transitions("1100", TDI_0);
+      break;
+   case TAP_DRPAUSE:
+      if (goal_state == TAP_DRSHIFT)
+         cjtag_transitions("10", TDI_0);
+      else if (goal_state == TAP_IRSHIFT)
+         cjtag_transitions("111100", TDI_0);
+      break;
+   case TAP_IRPAUSE:
+      if (goal_state == TAP_DRSHIFT)
+         cjtag_transitions("11100", TDI_0);
+      else if (goal_state == TAP_IRSHIFT)
+         cjtag_transitions("10", TDI_0);
+      break;
+   case TAP_IREXIT1:
+      if (goal_state == TAP_IRPAUSE)
+         cjtag_transitions("0", TDI_0);
+      else if (goal_state == TAP_IDLE)
+         cjtag_transitions("10", TDI_0);
+      break;
+   case TAP_DREXIT1:
+      if (goal_state == TAP_DRPAUSE)
+         cjtag_transitions("0", TDI_0);
+      else if (goal_state == TAP_IDLE)
+         cjtag_transitions("10", TDI_0);
+      break;
+   default:
+      break;
+   }
+
+   tap_set_state(goal_state);
+}
+
+static void cjtag_execute_idle_cycles(int32_t count)
+{
+
+   char buf[1024], * bp = buf; *bp = 0;
+   if (tap_get_state() != TAP_IDLE)
+      cjtag_move_to_state(TAP_IDLE);
+
+   for (int32_t i = 0; i < count; i++) {
+      strcat(bp, "0");   /* fill zeros for idle cycles */
+   }
+
+   transitions(buf, TDI_0);
+   if (tap_get_state() != TAP_IDLE)
+      cjtag_move_to_state(TAP_IDLE);
+
+}

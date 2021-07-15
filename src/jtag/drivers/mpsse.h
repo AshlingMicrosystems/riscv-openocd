@@ -74,5 +74,7 @@ int mpsse_set_frequency(struct mpsse_ctx *ctx, int frequency);
 /* Queue handling */
 int mpsse_flush(struct mpsse_ctx *ctx);
 void mpsse_purge(struct mpsse_ctx *ctx);
+void mpsse_write(struct mpsse_ctx* ctx, const uint8_t* out, unsigned out_length);
+void mpsse_read(struct mpsse_ctx* ctx, uint8_t* in, unsigned in_length);
 
 #endif /* OPENOCD_JTAG_DRIVERS_MPSSE_H */
